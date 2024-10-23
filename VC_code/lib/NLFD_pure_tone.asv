@@ -1,0 +1,222 @@
+function [Uf,AMat] = NLFD_pure_tone(MP,fMP,PoI,Nd,El,OHC,FLD,A0,AMat,Ce,Ge,Ie,V0,Uf)
+
+    tol = 1e-4;
+
+    [Ff, Uf, FLD] = loading_condition(MP,fMP,FLD,Ie,Uf); % pressure and Ie applied
+    % Rf is a reduced dof loading vector
+    % Uf is updated to contain input stapes pressure value
+    
+    icount = 0;
+
+    dA = cell(1,fMP.L); % crude way to initiate the decomposition cell array of LHS
+    
+    if (MP.key_fOHC || MP.key_fMET)
+        h = initiate_plots;
+    end   
+
+    while true
+       
+        icount = icount + 1;
+        Uf_n = Uf;
+        dtau = MP.dtau;
+
+        if (MP.key_fOHC || MP.key_fMET)
+            harmonics_threshold = 60;
+        else
+            harmonics_threshold = 0;
+        end
+
+        [fMP, Uf, dA] = evaluate_Uf(dtau,MP,fMP,Nd,El,OHC,FLD,A0,AMat,Ce,Ge,V0,Uf,dA,Ff,icount,harmonics_threshold);
+
+        HB = [OHC.HB];
+        po0 = transpose([HB.po0]);        
+        if MP.key_fOHC || MP.key_fMET % active cochlea condition
+            plot_output(h,MP,fMP,Nd,El,AMat,Uf,po0,V0)
+        drawnow
+        end
+
+        if ~(MP.key_fOHC || MP.key_fMET)
+            break;
+        end
+        g_res_val = evaluate_err(fMP,MP,Nd,PoI,Uf_n,Uf,icount,h);
+%         if (g_res_val < tol) || (icount == 10) || (g_res_val > 1e13)
+        if ((g_res_val < tol) || (g_res_val > 1e13))
+            break;
+        end
+    end
+end
+
+function [fMP, Uf, dA] = evaluate_Uf(dtau,MP,fMP,Nd,El,OHC,FLD,A0,AMat,Ce,Ge,V0,Uf,dA,Ff,icount,threshold)
+
+%     pool = gcp('nocreate');
+%     workers = 4;
+%     if ~isempty(pool)
+%         if ne(pool.NumWorkers, workers)
+%             delete(pool);
+%             parpool('local',workers);
+%         end
+%     else
+%         parpool('local',workers);
+%     end
+
+    MP.dtau = dtau;
+    key_fOHC = MP.key_fOHC;
+    key_fMET = MP.key_fMET;
+    opt_cfld = MP.opt_cfld;
+    R = Ff;
+    clear Ff;
+
+    %%%%%% gather the data needed for evaluating the nonlinear terms
+    if opt_cfld == 1 % Corti fluid nonlinear terms
+        CFLD = FLD.CFLD;
+        convection = zeros(CFLD.El.N, fMP.L);
+        permeation = zeros(CFLD.El.N, fMP.L);               
+        % extract required terms for Corti fluid nonlinearity
+        idx = reshape(MP.dof(6).cdof,2,[]); % 2 rows representing q and p of Corti respectively
+        
+        CQf = Uf(idx(1,:)',:);
+        CQ = inverse_fourier_transform(CQf);
+        CP = inverse_fourier_transform(Uf(idx(2,:)',:));
+        idx = MP.dof(1).pdof; idx = idx(FLD.indBM);
+        SP = inverse_fourier_transform(Uf(idx,:));
+        % Corti flux is updated from last iteration since it is 
+        % being used in the rhs vector of the pseudo time iterative method
+        CFLD.CQf = CQf; 
+        FLD.CFLD = CFLD;
+
+        parfor ti = 1:fMP.L
+            if opt_cfld == 1
+                [convection(:,ti),permeation(:,ti)] = evaluate_CFLD_nonlinear_terms(MP, FLD, CQ(:,ti),CP(:,ti),SP(:,ti));
+            end      
+        end   
+    end
+
+    po_f = zeros(MP.nz, fMP.L);
+    if key_fOHC || key_fMET % active cochlea condition
+        GV_nonlin = zeros(MP.dof(3).n, fMP.L); % initiate the nonlinear component of G*V in the circuit model            
+        % extract outer hair bundle deflection from element ANK
+        xxHB = HB_deflection(MP,El,Uf,60,icount);
+        idx = MP.dof(4).adof;
+        xa = inverse_fourier_transform(Uf(idx,:));
+        idx = MP.dof(5).odof;        
+        po_f = Uf(idx,:);
+        po = inverse_fourier_transform(po_f);
+        % extract voltage vector
+        idx = MP.dof(3).edof;        
+        voltage_f = Uf(idx,:);
+        voltage = inverse_fourier_transform(Uf(idx,:));
+        HB = [OHC.HB];
+        po_rhs = zeros(MP.nz, fMP.L);        
+        parfor ti = 1:fMP.L
+            po_rhs(:,ti) = channel_2state(HB, xxHB(:,ti), xa(:,ti));                            
+        end        
+        po_f_rhs = fourier_transform(po_rhs);
+        idx = (fMP.ffsym == 0);
+        po0 = po_f(:,idx);
+        parfor ti = 1:fMP.L
+            GV_nonlin(:,ti) = evaluate_GV_nonlin(MP,OHC,voltage(:,ti),po(:,ti),po0);
+        end
+        GV_nonlin_f = fourier_transform(GV_nonlin);
+
+        if icount > 1
+            nonlin = po_f_rhs;
+            nonlin(:,fMP.ffsym == 0) = 0;
+            fMP = identify_harmonics(fMP,nonlin,threshold);
+        end
+        Auo = AMat.Auo; % used to evaluate fMET rhs at rest
+        Aue = AMat.Aue; % used to evaluate fOHC rhs at rest
+        clear 'HB' 'xxHB' 'xa' 'voltage' 'po' 'po_rhs' 'GV_nonlin';
+    end
+
+    if opt_cfld == 1
+        CFLD = FLD.CFLD;
+        convection = fourier_transform(convection);
+        permeation = fourier_transform(permeation);
+        fMP = identify_harmonics(fMP,convection);
+
+        % probing the open probability nonlinearity convergence
+        figure(21); set(gcf,'Position',[710   525   560   420]); clf;
+        yy = mean(abs(convection),1);
+        plot(MP.ffsym,20*log10(yy),'ko-');
+        hold on;
+        plot(MP.ffsym(MP.ind),20*log10(yy(:,MP.ind)),'rx');
+        drawnow;
+
+        CFLD.convection = convection;
+        CFLD.permeation = permeation;
+        FLD.CFLD = CFLD;                
+    end
+
+    idx = MP.dof(2).udof;
+    uu_f = Uf(idx,fMP.ind);       
+    idx = MP.dof(1).pdof;
+    p_f = Uf(idx,fMP.ind);
+
+    R = R(:,fMP.ind);
+
+    for i = 1:length(fMP.ind) % loop over stim frequencies and their harmonics
+
+        fi = fMP.ind(i);
+        wk = 2*pi*fMP.ffsym(fi);
+
+        % RHS for CFLD nonlinearity is evaluated along with CLFD matrices
+        if opt_cfld == 1
+            FLD = make_CFLD_mat_nl(fi, MP, FLD, Nd, wk);
+            b = zeros(MP.tdof,1);
+            idx = MP.dof(6).cdof;
+            b(idx) = FLD.CFLD.b;
+            R(:,i) = R(:,i) + b(MP.BC,1);
+        end
+
+        if key_fOHC || key_fMET % active cochlea condition
+            % RHS for mechanotransduction nonlinearity
+            b = make_MET_RHS(wk,MP,V0,po0,Auo,Aue,po_f(:,fi),...
+                voltage_f(:,fi),po_f_rhs(:,fi),GV_nonlin_f(:,fi));
+            R(:,i) = R(:,i) + b;
+        end
+
+        b = make_structure_RHS(MP,Nd,uu_f(:,i));
+        R(:,i) = R(:,i) + b;
+
+        b = make_scalae_RHS(MP,FLD,p_f(:,i));
+        R(:,i) = R(:,i) + b;
+
+        if (icount == 1) || isempty(dA{fi}) % condition to make the new matrices for the rising harmonics
+            A = A0 + assemble_A1(Nd, FLD, MP, AMat, wk, Ce, Ge);            
+            if ~( key_fOHC || key_fMET ) % active cochlea condition
+                A = A(MP.act2psv,MP.act2psv);
+            end
+            dA{fi} = decompose_matrix(A);
+        end      
+    end % end of assembly
+
+    % prepare for Ax = b
+    if key_fOHC || key_fMET % active cochlea condition
+        row = MP.rdof;
+    else
+        row = MP.rdof_psv;
+        R = R(MP.act2psv,:);
+    end
+    a = zeros(row,length(fMP.ind),'like',1j);
+
+    % Ax = b
+   
+    for i = 1:length(fMP.ind) % loop over stim frequencies and their harmonics
+        fi = fMP.ind(i);
+        a(:,i) = dA{fi}\R(:,i);
+    end
+
+    % update Uf and relaxation
+    ind = false(1,fMP.L);
+    ind(fMP.ind) = true;
+    if key_fOHC || key_fMET % active cochlea condition
+        Uf(MP.BC,ind) = a;
+    else
+        
+        Uf(MP.BC_psv,ind) = a;
+    end
+    ind_conj = false(1,fMP.L);
+    ind_conj(fMP.L-fMP.ind+2) = true;
+    Uf(:,ind_conj) = conj(Uf(:,ind));    
+
+end

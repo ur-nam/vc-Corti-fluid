@@ -1,0 +1,50 @@
+function MP = identify_harmonics(MP,U)
+    
+    N = ndims(U); % this is to be able to take matrices that are of different dimensions
+    yy = reshape(mean(abs(U),1:N-1),1,MP.L);
+    yf = yy;
+    ffsym = MP.ffsym;
+%     figure(11); clf;
+%     plot(ffsym,20*log10(yy),'ko-');
+
+    % evaluate noise floor
+    tol = 20;
+    NF = inf;
+    while true 
+        NF0 = NF;
+        NF = mean(yf);
+        idx = yf > NF;
+        yf(idx) = [];
+        re_err = abs(20*log10(NF)-20*log10(NF0))/abs(20*log10(NF));
+        if (re_err < tol) || isnan(re_err)
+            break;
+        end
+    end
+
+    % determine frequency indices
+    signal_threshold = 40; % dB
+    ind = find( (20*log10(yy) > (max(20*log10(yy))-signal_threshold)) & MP.ffsym > 0);
+
+%     if isnan(re_err)
+%         ind = find( (20*log10(yy) > (max(20*log10(yy))-40)) & MP.ffsym > 0);
+%     else
+%         NF = median(yf);
+%         nn = 10;
+%         NF_std = 0;
+%         if ~isnan(std(20*log10(yf)))
+%             NF_std = nn*std(20*log10(yf));
+%         end
+%         hold on; plot(ffsym,20*log10(NF)*ones(1,MP.L),'r-',ffsym,(20*log10(NF)+NF_std)*ones(1,MP.L),'r--');
+%         ind = find( (20*log10(yy) > 20*log10(NF)+NF_std) & MP.ffsym >= 0);
+%     end  
+    
+%     ind = [MP.stim_ind,ind];
+    ind = [MP.ind,ind];
+    ind = unique(ind);
+
+    MP.NF = NF;
+    MP.ind = ind;
+
+%     hold on; plot(ffsym(ind),20*log10(yy(ind)),'rx')
+%     drawnow
+end
